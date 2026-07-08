@@ -1,8 +1,10 @@
 ﻿using DeltaQ.BsDiff;
-using DeltaQ.SuffixSorting;
 using DeltaQ.SuffixSorting.LibDivSufSort;
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -10,135 +12,158 @@ public static class Program
 {
     public static void Main(string[] args)
     {
-        if (!Directory.Exists(AppContext.BaseDirectory + "/PatchZone"))
-        {
-            Directory.CreateDirectory(AppContext.BaseDirectory + "/PatchZone");
-        }
-        if (!Directory.Exists(AppContext.BaseDirectory + "/OutPatch"))
-        {
-            Directory.CreateDirectory(AppContext.BaseDirectory + "/OutPatch");
-        }
+        string patchZoneDir = Path.Combine(AppContext.BaseDirectory, "PatchZone");
+        string outPatchDir = Path.Combine(AppContext.BaseDirectory, "OutPatch");
+
+        if (!Directory.Exists(patchZoneDir)) Directory.CreateDirectory(patchZoneDir);
+        if (!Directory.Exists(outPatchDir)) Directory.CreateDirectory(outPatchDir);
 
         while (true)
         {
             Console.Clear();
-            Console.WriteLine("=== DMR PATCH CREATOR TOOL ===");
-            Console.WriteLine("1. Create Delta Patch (Auto-named with SHA256)");
-            Console.WriteLine("2. Generate Baseline Hash Copy (Auto-named with SHA256)");
+            Console.WriteLine("== PATCH CREATOR ==");
+            Console.WriteLine("1. Create Patch");
+            Console.WriteLine("2. Generate Baseline Hash Copy");
             Console.WriteLine("3. Exit");
             Console.Write("\nSelect Mode: ");
 
-            string choice = Console.ReadLine() ?? "";
-            choice = choice.Trim();
-
+            string choice = (Console.ReadLine() ?? "").Trim();
             if (choice == "3") break;
 
             if (choice == "1")
             {
-                Console.WriteLine("\n[MODE 1: DELTA PATCH CREATION]");
-                Console.WriteLine("Enter Baseline File Name (e.g., baseline.zip):");
-                string baselineFileName = Console.ReadLine() ?? "";
-                baselineFileName = baselineFileName.Trim();
-                string baseLinePath = AppContext.BaseDirectory + "/PatchZone/" + baselineFileName;
+                Console.WriteLine("Enter Baseline ZIP Name (e.g., baseline.zip):");
+                string baseLinePath = Path.Combine(patchZoneDir, (Console.ReadLine() ?? "").Trim());
 
-                Console.WriteLine("Enter Updated File Name (e.g., updated.zip):");
-                string updatedFileName = Console.ReadLine() ?? "";
-                updatedFileName = updatedFileName.Trim();
-                string updatedPath = AppContext.BaseDirectory + "/PatchZone/" + updatedFileName;
+                Console.WriteLine("Enter Updated ZIP Name (e.g., updated.zip):");
+                string updatedPath = Path.Combine(patchZoneDir, (Console.ReadLine() ?? "").Trim());
 
                 if (!File.Exists(baseLinePath) || !File.Exists(updatedPath))
                 {
-                    Console.WriteLine("Error: Source files could not be found inside PatchZone directory! Press any key to continue...");
+                    Console.WriteLine("Files missing! Press any key...");
                     Console.ReadKey();
                     continue;
                 }
 
-                CreatePatch(baseLinePath, updatedPath);
+                CreateSmartPatch(baseLinePath, updatedPath);
             }
             else if (choice == "2")
             {
-                Console.WriteLine("\n[MODE 2: BASELINE HASH GENERATION]");
-                Console.WriteLine("Enter Baseline File Name to rename with Hash:");
-                string baselineFileName = Console.ReadLine() ?? "";
-                baselineFileName = baselineFileName.Trim();
-                string baseLinePath = AppContext.BaseDirectory + "/PatchZone/" + baselineFileName;
-
-                if (!File.Exists(baseLinePath))
-                {
-                    Console.WriteLine("Error: Source baseline file could not be found inside PatchZone! Press any key to continue...");
-                    Console.ReadKey();
-                    continue;
-                }
-
-                CreateHashNamedBaseline(baseLinePath);
+                Console.WriteLine("Enter Baseline File Name:");
+                string baseLinePath = Path.Combine(patchZoneDir, (Console.ReadLine() ?? "").Trim());
+                if (File.Exists(baseLinePath)) CreateHashNamedBaseline(baseLinePath);
             }
-            else
-            {
-                Console.WriteLine("Invalid selection. Press any key to retry...");
-                Console.ReadKey();
-                continue;
-            }
-
-            Console.WriteLine("\nOperation completed successfully! Press any key to return to menu...");
-            Console.ReadKey();
         }
     }
 
-    public static void CreatePatch(string baselinePath, string updatedPath)
+    public static void CreateSmartPatch(string baselineZip, string updatedZip)
     {
-        Console.WriteLine("Reading files into memory pipeline...");
-        var oldData = File.ReadAllBytes(baselinePath);
-        var newData = File.ReadAllBytes(updatedPath);
+        string tempDir = Path.Combine(AppContext.BaseDirectory, "TempProcessing");
+        string oldExtract = Path.Combine(tempDir, "Old");
+        string newExtract = Path.Combine(tempDir, "New");
+        string patchBuildDir = Path.Combine(tempDir, "PatchContainer");
 
-        string tempPatchPath = Path.Combine(AppContext.BaseDirectory, "OutPatch", "temp_building.delta");
-        if (File.Exists(tempPatchPath)) File.Delete(tempPatchPath);
+        if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+        Directory.CreateDirectory(oldExtract);
+        Directory.CreateDirectory(newExtract);
+        Directory.CreateDirectory(patchBuildDir);
 
-        Console.WriteLine("Running LibDivSufSort suffix sort and calculating compression streams...");
-        using (var outStream = File.Create(tempPatchPath))
+        Console.WriteLine("Extracting archives for file-by-file comparison...");
+        ZipFile.ExtractToDirectory(baselineZip, oldExtract);
+        ZipFile.ExtractToDirectory(updatedZip, newExtract);
+
+        List<string> deletions = new List<string>();
+        var oldFiles = Directory.GetFiles(oldExtract, "*.*", SearchOption.AllDirectories);
+        var newFiles = Directory.GetFiles(newExtract, "*.*", SearchOption.AllDirectories);
+
+        var oldRelativePaths = oldFiles.Select(f => Path.GetRelativePath(oldExtract, f)).ToHashSet();
+        var newRelativePaths = newFiles.Select(f => Path.GetRelativePath(newExtract, f)).ToHashSet();
+
+        Console.WriteLine("Analyzing structural changes...");
+        var suffixSorter = new LibDivSufSort();
+
+        // 1. Check for Additions and Modifications
+        foreach (string newRelPath in newRelativePaths)
         {
-            ISuffixSort suffixSorter = new LibDivSufSort();
-            Diff.Create(oldData, newData, outStream, suffixSorter);
+            string newFilePath = Path.Combine(newExtract, newRelPath);
+            string oldFilePath = Path.Combine(oldExtract, newRelPath);
+            string patchDestPath = Path.Combine(patchBuildDir, newRelPath);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(patchDestPath)!);
+
+            if (oldRelativePaths.Contains(newRelPath))
+            {
+                // File exists in both. Check if it changed.
+                if (GetFileSHA256(oldFilePath) != GetFileSHA256(newFilePath))
+                {
+                    if (GetFileSHA256(oldFilePath) != GetFileSHA256(newFilePath))
+                    {
+                        Console.WriteLine($"[MODIFIED] Diffing {newRelPath}...");
+
+                        byte[] oldFs = File.ReadAllBytes(oldFilePath);
+                        byte[] newFs = File.ReadAllBytes(newFilePath);
+
+                        using (var outStream = File.Create(patchDestPath + ".delta"))
+                        {
+                            DeltaQ.BsDiff.Diff.Create(oldFs, newFs, outStream, suffixSorter);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine($"[ADDED] {newRelPath}");
+                File.Copy(newFilePath, patchDestPath, true);
+            }
         }
 
-        Console.WriteLine("Calculating cryptographic SHA256 checksum signature...");
-        string patchHash = GetFileSHA256(tempPatchPath);
+        foreach (string oldRelPath in oldRelativePaths)
+        {
+            if (!newRelativePaths.Contains(oldRelPath))
+            {
+                Console.WriteLine($"[DELETED] {oldRelPath}");
+                deletions.Add(oldRelPath);
+            }
+        }
 
-        string finalPatchPath = Path.Combine(AppContext.BaseDirectory, "OutPatch", patchHash + ".delta");
+        if (deletions.Count > 0)
+        {
+            File.WriteAllLines(Path.Combine(patchBuildDir, "dmr_deletions.txt"), deletions);
+        }
+
+        Console.WriteLine("\nPackaging smart patch container...");
+        string tempPatchZip = Path.Combine(tempDir, "temp_patch.zip");
+        ZipFile.CreateFromDirectory(patchBuildDir, tempPatchZip, CompressionLevel.Optimal, false);
+
+        string patchHash = GetFileSHA256(tempPatchZip);
+        string finalPatchPath = Path.Combine(AppContext.BaseDirectory, "OutPatch", patchHash + ".patch");
 
         if (File.Exists(finalPatchPath)) File.Delete(finalPatchPath);
-        File.Move(tempPatchPath, finalPatchPath);
+        File.Move(tempPatchZip, finalPatchPath);
 
-        Console.WriteLine($"\nPatch File generated completely: {patchHash}.delta");
+        Console.WriteLine("Cleaning up temporary workspace...");
+        Directory.Delete(tempDir, true);
+
+        Console.WriteLine($"\nSmart Patch generated completely: {patchHash}.patch");
     }
 
     public static void CreateHashNamedBaseline(string baselinePath)
     {
-        Console.WriteLine("Calculating baseline cryptographic SHA256 checksum signature...");
-        string baselineHash = GetFileSHA256(baselinePath);
-        string fileExtension = Path.GetExtension(baselinePath);
-
-        string finalBaselinePath = Path.Combine(AppContext.BaseDirectory, "OutPatch", baselineHash + fileExtension.ToLower());
-
-        Console.WriteLine("Copying asset file to destination mirror directory...");
-        File.Copy(baselinePath, finalBaselinePath, true);
-
-        Console.WriteLine($"\nBaseline asset successfully copied: {baselineHash}{fileExtension.ToLower()}");
+        string hash = GetFileSHA256(baselinePath);
+        string ext = Path.GetExtension(baselinePath);
+        File.Copy(baselinePath, Path.Combine(AppContext.BaseDirectory, "OutPatch", hash + ext.ToLower()), true);
+        Console.WriteLine($"Baseline copied: {hash}{ext.ToLower()}");
     }
 
     private static string GetFileSHA256(string filePath)
     {
-        using (SHA256 sha256Hash = SHA256.Create())
-        using (FileStream fs = File.OpenRead(filePath))
+        using (var sha256 = SHA256.Create())
+        using (var fs = File.OpenRead(filePath))
         {
-            byte[] hashBytes = sha256Hash.ComputeHash(fs);
-            StringBuilder hashStringBuilder = new StringBuilder();
-
-            foreach (byte b in hashBytes)
-            {
-                hashStringBuilder.Append(b.ToString("x2"));
-            }
-
-            return hashStringBuilder.ToString();
+            byte[] hash = sha256.ComputeHash(fs);
+            var sb = new StringBuilder(64);
+            foreach (byte b in hash) sb.Append(b.ToString("x2"));
+            return sb.ToString();
         }
     }
 }
